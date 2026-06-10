@@ -79,6 +79,27 @@ class EventPayload(BaseModel):
         extra = "allow"
 
 
+class RobotEventRequest(BaseModel):
+    """Body for POST /event. Named fields here are what SAP Joule renders as
+    input fields. Any extra fields you send (e.g. start_now, pick_location)
+    are still accepted and stored as event data."""
+    robot_id: str = Field(..., description="Target robot id, e.g. 'robot-01'", examples=["robot-01"])
+    event: str = Field(..., description="Event name to post, e.g. 'task'", examples=["task"])
+    metadata: Optional[Dict[str, Any]] = Field(
+        None, description="Optional metadata object, e.g. {\"source\": \"joule\", \"priority\": \"high\"}"
+    )
+    task_type: Optional[str] = Field(
+        None, description="Task type for the robot, e.g. 'inspection' or 'pick_and_place'",
+        examples=["inspection"],
+    )
+    start_now: Optional[bool] = Field(None, description="Start the task immediately")
+    pick_location: Optional[str] = Field(None, description="Pick location (for pick_and_place), e.g. 'shelf-A3'")
+    place_location: Optional[str] = Field(None, description="Place location (for pick_and_place), e.g. 'bin-B7'")
+
+    class Config:
+        extra = "allow"  # arbitrary extra fields are still accepted and stored as data
+
+
 class EventResponse(BaseModel):
     status: str = Field(..., description="success or error")
     event: str = Field(..., description="The event name that was posted")
@@ -204,7 +225,7 @@ async def root():
     tags=["Events"],
 )
 async def post_event_body(
-    payload: Dict[str, Any] = Body(
+    payload: RobotEventRequest = Body(
         ...,
         openapi_examples={
             "inspection_now": {
@@ -231,7 +252,15 @@ async def post_event_body(
         },
     )
 ):
-    robot_id, event_name, metadata, data = extract_from_body(payload)
+    # model_dump keeps both the named fields and any extra fields the caller sent.
+    body = payload.model_dump(exclude_none=True)
+    robot_id = str(body.pop("robot_id"))
+    event_name = str(body.pop("event"))
+    metadata = body.pop("metadata", None)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise HTTPException(status_code=422, detail="'metadata' must be a JSON object.")
+    # everything left over is the event data
+    data = body
     return await process_event(robot_id, event_name, data, metadata, source="joule")
 
 
