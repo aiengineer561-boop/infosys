@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 import uvicorn
@@ -299,6 +300,91 @@ async def health():
         "robots": len(EVENT_STORE),
         "connections": len(manager.active_connections)
     }
+
+
+# -----------------------------
+# OpenAPI 3.0.0 compatibility (SAP Joule reads /openapi.json)
+# FastAPI/Pydantic v2 emit 3.1.0 by default, which SAP tooling rejects.
+# We generate the spec, then down-convert the 3.1-only constructs to 3.0.0.
+# -----------------------------
+def _downconvert_to_30(node):
+    """Recursively rewrite 3.1-only JSON-Schema constructs into 3.0.0 form."""
+    if isinstance(node, list):
+        return [_downconvert_to_30(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+
+    node = {k: _downconvert_to_30(v) for k, v in node.items()}
+
+    # 1) type arrays e.g. ["string","null"] -> type:"string" + nullable:true
+    if isinstance(node.get("type"), list):
+        types = [t for t in node["type"] if t != "null"]
+        if "null" in node["type"]:
+            node["nullable"] = True
+        if len(types) == 1:
+            node["type"] = types[0]
+        elif not types:
+            node.pop("type", None)
+        else:
+            node.pop("type")
+            node["anyOf"] = node.get("anyOf", []) + [{"type": t} for t in types]
+
+    # 2) anyOf/oneOf containing {"type":"null"} -> drop it, mark nullable
+    for key in ("anyOf", "oneOf"):
+        if isinstance(node.get(key), list):
+            non_null = [s for s in node[key] if s != {"type": "null"}]
+            if len(non_null) != len(node[key]):
+                node["nullable"] = True
+            if len(non_null) == 1:
+                only = non_null[0]
+                node.pop(key)
+                for k, v in only.items():
+                    node.setdefault(k, v)
+            else:
+                node[key] = non_null
+
+    # 3) numeric exclusiveMinimum/Maximum (3.1) -> boolean form (3.0)
+    for bound, excl in (("minimum", "exclusiveMinimum"), ("maximum", "exclusiveMaximum")):
+        if excl in node and isinstance(node[excl], (int, float)) and not isinstance(node[excl], bool):
+            node[bound] = node[excl]
+            node[excl] = True
+
+    # 4) const (3.1) -> single-value enum (3.0)
+    if "const" in node:
+        node["enum"] = [node.pop("const")]
+
+    # 5) schema-level `examples` array (3.1) -> single `example` (3.0)
+    if isinstance(node.get("examples"), list):
+        ex = node.pop("examples")
+        if ex:
+            node["example"] = ex[0]
+
+    # 6) strip 3.1-only keywords that 3.0 validators reject
+    for dead in ("$schema", "contentMediaType", "contentEncoding",
+                 "unevaluatedProperties", "patternProperties", "$comment"):
+        node.pop(dead, None)
+
+    return node
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        contact=app.contact,
+        servers=app.servers,
+        routes=app.routes,
+    )
+    schema = _downconvert_to_30(schema)
+    schema["openapi"] = "3.0.0"
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 
 # -----------------------------
