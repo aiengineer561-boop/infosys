@@ -25,7 +25,7 @@ received.
 
 app = FastAPI(
     title="Daksha Robot Event API",
-    version="2.8.0",
+    version="2.8.1",
     description=API_DESCRIPTION,
     contact={"name": "Daksha", "url": "https://tara-gen-1v2.onrender.com"},
     servers=[
@@ -72,12 +72,15 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "robot_maps")
 
 supabase = None
+# Per-operation last error, surfaced in /health and /debug/supabase.
+SUPABASE_ERRORS: Dict[str, Optional[str]] = {"init": None, "save": None, "load": None, "delete": None}
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         from supabase import create_client
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         print(f"[supabase] connected; map store -> table '{SUPABASE_TABLE}'")
     except Exception as e:  # package missing or bad config -> fall back to files
+        SUPABASE_ERRORS["init"] = str(e)
         print(f"[supabase] disabled, falling back to local files: {e}")
         supabase = None
 else:
@@ -369,9 +372,11 @@ def map_save(robot_id: str, names: List[str]) -> str:
                 },
                 on_conflict="robot_id",
             ).execute()
+            SUPABASE_ERRORS["save"] = None
             return f"supabase:{SUPABASE_TABLE}"
         except Exception as e:
-            # don't lose the map if Supabase hiccups -> fall back to a local file
+            # don't lose the map if Supabase fails -> fall back to a local file
+            SUPABASE_ERRORS["save"] = str(e)
             print(f"[supabase] save failed, falling back to file: {e}")
 
     return _file_save(robot_id, names)
@@ -379,7 +384,7 @@ def map_save(robot_id: str, names: List[str]) -> str:
 
 def map_load(robot_id: str) -> List[str]:
     """Load a robot's POI names. Prefers Supabase, then the local file, then the
-    in-memory cache. Returns [] if nothing is found."""
+    in-memory cache. Returns [] if nothing is found anywhere."""
     if supabase is not None:
         try:
             result = (
@@ -388,25 +393,27 @@ def map_load(robot_id: str) -> List[str]:
                 .eq("robot_id", robot_id)
                 .execute()
             )
+            SUPABASE_ERRORS["load"] = None
             if result.data:
                 names = normalize_poi_names(result.data[0].get("pois", []))
                 POI_STORE[robot_id] = names
                 return names
-            return []
+            # Supabase reachable but no row for this robot.
+            # Fall through to file/cache in case a save fell back to a file.
         except Exception as e:
+            SUPABASE_ERRORS["load"] = str(e)
             print(f"[supabase] load failed, falling back to file/cache: {e}")
 
     names = _file_load(robot_id)
     if names is None:
-        names = POI_STORE.get(robot_id, [])
-    else:
-        POI_STORE[robot_id] = names
+        return POI_STORE.get(robot_id, [])
+    POI_STORE[robot_id] = names
     return names
 
 
 def map_delete(robot_id: str) -> Dict[str, Any]:
-    """Delete a robot's map from Supabase (or the local file) and the in-memory
-    cache. Returns what was removed."""
+    """Delete a robot's map from Supabase AND the local file (and the in-memory
+    cache). Returns what was removed."""
     had_cache = robot_id in POI_STORE
     name_count = len(POI_STORE.get(robot_id, []))
     POI_STORE.pop(robot_id, None)
@@ -421,13 +428,16 @@ def map_delete(robot_id: str) -> Dict[str, Any]:
                 .eq("robot_id", robot_id)
                 .execute()
             )
+            SUPABASE_ERRORS["delete"] = None
             removed = bool(result.data)
             backend = "supabase"
         except Exception as e:
+            SUPABASE_ERRORS["delete"] = str(e)
             print(f"[supabase] delete failed, falling back to file: {e}")
-            removed = _file_delete(robot_id)
-    else:
-        removed = _file_delete(robot_id)
+
+    # always also clear any local fallback file
+    file_removed = _file_delete(robot_id)
+    removed = removed or file_removed
 
     return {
         "existed": removed or had_cache,
@@ -931,7 +941,62 @@ async def health():
     return {
         "status": "ok",
         "robots": len(EVENT_STORE),
-        "connections": len(manager.active_connections)
+        "connections": len(manager.active_connections),
+        "supabase": {
+            "enabled": supabase is not None,
+            "table": SUPABASE_TABLE,
+            "errors": SUPABASE_ERRORS,   # per-op; null means that op last succeeded
+        },
+    }
+
+
+@app.get(
+    "/debug/supabase",
+    summary="Live Supabase connectivity probe",
+    description="Runs a real upsert -> select -> delete against the Supabase table "
+                "using a throwaway probe row, and reports exactly which step fails "
+                "and why. Use this to diagnose map storage problems.",
+    operation_id="debugSupabase",
+    tags=["Info"],
+)
+async def debug_supabase():
+    if supabase is None:
+        return {
+            "enabled": False,
+            "reason": "SUPABASE_URL/SUPABASE_KEY not set, or client init failed",
+            "init_error": SUPABASE_ERRORS["init"],
+        }
+
+    probe_id = "__probe__"
+    steps: Dict[str, str] = {}
+
+    try:
+        supabase.table(SUPABASE_TABLE).upsert(
+            {"robot_id": probe_id, "map_name": "probe", "pois": [],
+             "updated_at": datetime.utcnow().isoformat()},
+            on_conflict="robot_id",
+        ).execute()
+        steps["upsert"] = "ok"
+    except Exception as e:
+        steps["upsert"] = f"FAILED: {e}"
+
+    try:
+        r = supabase.table(SUPABASE_TABLE).select("*").eq("robot_id", probe_id).execute()
+        steps["select"] = "ok" if r.data else "ok (no row returned)"
+    except Exception as e:
+        steps["select"] = f"FAILED: {e}"
+
+    try:
+        supabase.table(SUPABASE_TABLE).delete().eq("robot_id", probe_id).execute()
+        steps["delete"] = "ok"
+    except Exception as e:
+        steps["delete"] = f"FAILED: {e}"
+
+    return {
+        "enabled": True,
+        "table": SUPABASE_TABLE,
+        "ok": all(v.startswith("ok") for v in steps.values()),
+        "steps": steps,
     }
 
 
