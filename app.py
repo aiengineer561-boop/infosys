@@ -7,7 +7,10 @@ import uvicorn
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# India Standard Time (UTC+5:30, no DST)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Description shown to SAP Joule when it reads the OpenAPI spec.
 # Joule uses this text to understand what the API does.
@@ -368,7 +371,7 @@ def map_save(robot_id: str, names: List[str]) -> str:
                     "robot_id": robot_id,
                     "map_name": f"{robot_id}_map",
                     "pois": navigation,
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.now(IST).isoformat(),
                 },
                 on_conflict="robot_id",
             ).execute()
@@ -459,7 +462,7 @@ def build_navigation(robot_id: str, names: List[str]) -> List[Dict[str, Any]]:
 async def process_event(robot_id: str, event_name: str, data: Dict[str, Any],
                         incoming_meta: Optional[Dict[str, Any]], source: str) -> EventResponse:
     """Shared logic: build metadata, store the event, broadcast it, return a response."""
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(IST).isoformat()
     metadata = build_metadata(incoming_meta, source, timestamp)
 
     store_event(robot_id, event_name, data, metadata, timestamp)
@@ -776,7 +779,7 @@ async def post_map(
                     "or a dict keyed by name."),
         )
 
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(IST).isoformat()
     metadata = build_metadata(payload.metadata, source="robot", timestamp=timestamp)
 
     saved_to = map_save(robot_id, names)
@@ -841,7 +844,7 @@ async def get_map(robot_id: str):
 async def delete_map(robot_id: str):
     result = map_delete(robot_id)
 
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(IST).isoformat()
     metadata = build_metadata(None, source="api", timestamp=timestamp)
     event_data = {
         "deleted": result["deleted"],
@@ -973,7 +976,7 @@ async def debug_supabase():
     try:
         supabase.table(SUPABASE_TABLE).upsert(
             {"robot_id": probe_id, "map_name": "probe", "pois": [],
-             "updated_at": datetime.utcnow().isoformat()},
+             "updated_at": datetime.now(IST).isoformat()},
             on_conflict="robot_id",
         ).execute()
         steps["upsert"] = "ok"
