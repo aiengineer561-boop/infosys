@@ -882,6 +882,498 @@ async def delete_map(robot_id: str):
 
 
 # -----------------------------
+# robot-status + inspection-image (NEW)
+# Declared BEFORE the generic /event/{robot_id}/... routes — same reason the map
+# routes above are: their two-segment GET paths must match here and not get
+# swallowed by /event/{robot_id}/{event_name}.
+# Both persist to Supabase when it is configured; otherwise they keep an
+# in-memory copy so the API still works.
+# -----------------------------
+SUPABASE_STATUS_TABLE = os.getenv("SUPABASE_STATUS_TABLE", "robot_status")
+SUPABASE_IMAGE_TABLE = os.getenv("SUPABASE_IMAGE_TABLE", "inspection_images")
+
+# in-memory fallbacks (robot_id -> ...)
+STATUS_STORE: Dict[str, Dict[str, Any]] = {}
+IMAGE_STORE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+class RobotStatusUpdateRequest(BaseModel):
+    """Body for POST /event/robot-status. Reports a robot's current status
+    (e.g. 'idle', 'working', 'charging', 'error'). The latest status is saved
+    per robot to Supabase and can be fetched back by robot id."""
+    robot_id: str = Field(..., description="Target robot id, e.g. 'robot-01'", examples=["robot-01"])
+    status: str = Field(..., description="Current robot status, e.g. 'idle', 'working', 'charging', 'error'", examples=["idle"])
+    battery: Optional[float] = Field(None, description="Battery percentage 0-100", examples=[87.5])
+    location: Optional[str] = Field(None, description="Where the robot currently is, e.g. 'zone-C1'", examples=["zone-C1"])
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata object")
+
+    class Config:
+        extra = "allow"
+
+
+class InspectionImageRequest(BaseModel):
+    """Body for POST /event/inspection-image. Stores one or more inspection-image
+    LINKS for a robot. Put the robot id in 'robot_id' and the link(s) in
+    'image_url' (a single URL) and/or 'image_urls' (a list of URLs). The links are
+    saved to Supabase and can later be fetched by robot id, so the user gets back
+    the image links for that robot."""
+    robot_id: str = Field(..., description="Reporting robot id, e.g. 'robot-01'", examples=["robot-01"])
+    image_url: Optional[str] = Field(
+        None, description="A single inspection image link",
+        examples=["https://example.com/inspections/robot-01/frame1.jpg"],
+    )
+    image_urls: Optional[List[str]] = Field(None, description="Several inspection image links")
+    location: Optional[str] = Field(None, description="Where the image was captured, e.g. 'zone-C1'", examples=["zone-C1"])
+    note: Optional[str] = Field(None, description="Optional caption/note for the image(s)")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata object")
+
+    class Config:
+        extra = "allow"
+
+
+# ---- Supabase-backed stores (with in-memory fallback) ----
+def status_save(robot_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Save/replace a robot's latest status. One row per robot (upsert on robot_id)."""
+    STATUS_STORE[robot_id] = row
+    if supabase is not None:
+        try:
+            supabase.table(SUPABASE_STATUS_TABLE).upsert(row, on_conflict="robot_id").execute()
+        except Exception as e:
+            print(f"[supabase] robot-status save failed (kept in memory): {e}")
+    return row
+
+
+def status_load(robot_id: str) -> Optional[Dict[str, Any]]:
+    """Load a robot's latest status. Prefers Supabase, falls back to memory."""
+    if supabase is not None:
+        try:
+            res = supabase.table(SUPABASE_STATUS_TABLE).select("*").eq("robot_id", robot_id).execute()
+            if res.data:
+                STATUS_STORE[robot_id] = res.data[0]
+                return res.data[0]
+        except Exception as e:
+            print(f"[supabase] robot-status load failed, using memory: {e}")
+    return STATUS_STORE.get(robot_id)
+
+
+def image_save(robot_id: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append inspection-image links for a robot. Saves to Supabase when
+    configured; always keeps an in-memory copy."""
+    IMAGE_STORE.setdefault(robot_id, []).extend(rows)
+    if supabase is not None:
+        try:
+            supabase.table(SUPABASE_IMAGE_TABLE).insert(rows).execute()
+        except Exception as e:
+            print(f"[supabase] inspection-image save failed (kept in memory): {e}")
+    return rows
+
+
+def image_load(robot_id: str, limit: int = 50, offset: int = 0,
+               newest_first: bool = True):
+    """Load a page of inspection-image links for a robot. There can be many images,
+    so this is paginated. Prefers Supabase (the limit/offset/order are applied in
+    the query so only one page is fetched), falls back to memory. Returns
+    (rows, total) where total is the full count for the robot."""
+    if supabase is not None:
+        try:
+            res = (
+                supabase.table(SUPABASE_IMAGE_TABLE)
+                .select("*", count="exact")
+                .eq("robot_id", robot_id)
+                .order("created_at", desc=newest_first)
+                .range(offset, offset + limit - 1)
+                .execute()
+            )
+            if res.data is not None:
+                total = res.count if res.count is not None else len(res.data)
+                return res.data, total
+        except Exception as e:
+            print(f"[supabase] inspection-image load failed, using memory: {e}")
+
+    all_rows = IMAGE_STORE.get(robot_id, [])
+    total = len(all_rows)
+    ordered = list(reversed(all_rows)) if newest_first else list(all_rows)
+    return ordered[offset:offset + limit], total
+
+
+@app.post(
+    "/event/robot-status",
+    response_model=EventResponse,
+    summary="Report a robot's current status",
+    description=(
+        "Report a robot's current status (e.g. 'idle', 'working', 'charging', "
+        "'error'), with optional battery and location. The latest status is saved "
+        "per robot to Supabase, added to the event log, and broadcast to WebSocket "
+        "listeners. Fetch it back with GET /event/robot-status/{robot_id}."
+    ),
+    operation_id="postRobotStatusUpdate",
+    tags=["Events"],
+)
+async def post_robot_status_update(
+    payload: RobotStatusUpdateRequest = Body(
+        ...,
+        openapi_examples={
+            "idle": {"summary": "Idle", "value": {"robot_id": "robot-01", "status": "idle", "battery": 92}},
+            "working": {
+                "summary": "Working",
+                "value": {"robot_id": "robot-01", "status": "working", "battery": 64, "location": "zone-C1"},
+            },
+        },
+    )
+):
+    robot_id = str(payload.robot_id)
+    timestamp = datetime.now(IST).isoformat()
+    row = {
+        "robot_id": robot_id,
+        "status": payload.status,
+        "battery": payload.battery,
+        "location": payload.location,
+        "updated_at": timestamp,
+    }
+    status_save(robot_id, row)
+
+    metadata = build_metadata(payload.metadata, source="joule", timestamp=timestamp)
+    event_data = {"status": payload.status, "battery": payload.battery, "location": payload.location}
+    store_event(robot_id, "robot-status", event_data, metadata, timestamp)
+    await manager.broadcast({
+        "type": "event",
+        "robot": robot_id,
+        "event": "robot-status",
+        "data": event_data,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    })
+
+    return EventResponse(
+        status="success",
+        event="robot-status",
+        message=f"Robot {robot_id}: status '{payload.status}' saved",
+        data={"robot": robot_id, **event_data},
+        metadata=metadata,
+        timestamp=timestamp,
+    )
+
+
+@app.get(
+    "/event/robot-status/{robot_id}",
+    summary="Get a robot's current status",
+    description="Returns the latest saved status for a robot (from Supabase, or the in-memory copy).",
+    operation_id="getRobotStatusUpdate",
+    tags=["Events"],
+)
+async def get_robot_status_update(robot_id: str):
+    status = status_load(robot_id)
+    return {"robot": robot_id, "found": status is not None, "status": status}
+
+
+@app.post(
+    "/event/inspection-image",
+    summary="Upload inspection image link(s) for a robot",
+    description=(
+        "Store one or more inspection-image LINKS for a robot. Send the robot id in "
+        "'robot_id' and the link(s) in 'image_url' (single) and/or 'image_urls' "
+        "(list). The links are saved to Supabase, added to the event log, and "
+        "broadcast to WebSocket listeners. Fetch them back as links with "
+        "GET /event/inspection-image/{robot_id}."
+    ),
+    operation_id="postInspectionImage",
+    tags=["Events"],
+)
+async def post_inspection_image(
+    payload: InspectionImageRequest = Body(
+        ...,
+        openapi_examples={
+            "single": {
+                "summary": "One image link",
+                "value": {
+                    "robot_id": "robot-01",
+                    "image_url": "https://example.com/insp/robot-01/frame1.jpg",
+                    "location": "zone-C1",
+                },
+            },
+            "many": {
+                "summary": "Several image links",
+                "value": {
+                    "robot_id": "robot-01",
+                    "image_urls": [
+                        "https://example.com/insp/robot-01/frame1.jpg",
+                        "https://example.com/insp/robot-01/frame2.jpg",
+                    ],
+                    "note": "rack inspection",
+                },
+            },
+        },
+    )
+):
+    robot_id = str(payload.robot_id)
+
+    urls: List[str] = []
+    if payload.image_url:
+        urls.append(payload.image_url)
+    if payload.image_urls:
+        urls.extend(payload.image_urls)
+    urls = [u.strip() for u in urls if isinstance(u, str) and u.strip()]
+    if not urls:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least one image link in 'image_url' or 'image_urls'.",
+        )
+
+    timestamp = datetime.now(IST).isoformat()
+    rows = [
+        {
+            "robot_id": robot_id,
+            "image_url": u,
+            "location": payload.location,
+            "note": payload.note,
+            "created_at": timestamp,
+        }
+        for u in urls
+    ]
+    image_save(robot_id, rows)
+
+    metadata = build_metadata(payload.metadata, source="robot", timestamp=timestamp)
+    event_data = {"links": urls, "image_count": len(urls), "location": payload.location, "note": payload.note}
+    store_event(robot_id, "inspection-image", event_data, metadata, timestamp)
+    await manager.broadcast({
+        "type": "event",
+        "robot": robot_id,
+        "event": "inspection-image",
+        "data": event_data,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    })
+
+    return {
+        "status": "success",
+        "event": "inspection-image",
+        "robot_id": robot_id,
+        "message": f"Robot {robot_id}: {len(urls)} inspection image link(s) saved",
+        "image_count": len(urls),
+        "links": urls,
+        "images": rows,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    }
+
+
+@app.get(
+    "/event/inspection-image/{robot_id}",
+    summary="Get a robot's inspection image links",
+    description=(
+        "Returns inspection-image links saved for a robot. There can be many images, "
+        "so results are paginated: use 'limit' (default 50, max 200) and 'offset' to "
+        "page, and 'order' to sort newest- or oldest-first. 'total' is the full count "
+        "for the robot, 'returned' is how many are in this page. The 'links' array is "
+        "a plain list of image URLs the user can open; 'images' has the full rows "
+        "(link + location + note + time)."
+    ),
+    operation_id="getInspectionImages",
+    tags=["Events"],
+)
+async def get_inspection_images(
+    robot_id: str,
+    limit: int = Query(50, ge=1, le=200, description="Max images to return (1-200)"),
+    offset: int = Query(0, ge=0, description="How many images to skip (for paging)"),
+    order: str = Query("newest", pattern="^(newest|oldest)$", description="Sort order: 'newest' or 'oldest'"),
+):
+    newest_first = order != "oldest"
+    images, total = image_load(robot_id, limit=limit, offset=offset, newest_first=newest_first)
+    links = [img.get("image_url") for img in images if img.get("image_url")]
+    return {
+        "robot": robot_id,
+        "total": total,
+        "returned": len(images),
+        "limit": limit,
+        "offset": offset,
+        "order": "newest" if newest_first else "oldest",
+        "has_more": offset + len(images) < total,
+        "links": links,
+        "images": images,
+    }
+
+
+# -----------------------------
+# inspection-summary (NEW)
+# Stores an inspection summary for a robot, tied to the inspection/schedule id
+# that was generated elsewhere. Append-only: each POST adds a row. Persists to
+# Supabase when configured, else keeps an in-memory copy. Declared BEFORE the
+# generic /event/{robot_id}/... routes so its two-segment GET path isn't swallowed.
+# -----------------------------
+SUPABASE_SUMMARY_TABLE = os.getenv("SUPABASE_SUMMARY_TABLE", "inspection_summaries")
+
+# in-memory fallback: robot_id -> [summary_row, ...]
+SUMMARY_STORE: Dict[str, List[Dict[str, Any]]] = {}
+
+
+class InspectionSummaryRequest(BaseModel):
+    """Body for POST /event/inspection-summary. Stores an inspection summary for a
+    robot, tied to the generated inspection/schedule id. Send the robot id in
+    'robot_id', the generated id in 'inspection_id' and/or 'schedule_id' (at least
+    one is required), and the summary text in 'summary'. Optionally attach status,
+    location, and image links. Fetch them back by robot id."""
+    robot_id: str = Field(..., description="Target robot id, e.g. 'robot-01'", examples=["robot-01"])
+    inspection_id: Optional[str] = Field(
+        None, description="The generated inspection id, e.g. 'insp-2026-0042'", examples=["insp-2026-0042"]
+    )
+    schedule_id: Optional[str] = Field(
+        None, description="The generated schedule id, e.g. 'sch-1187'", examples=["sch-1187"]
+    )
+    summary: str = Field(..., description="The inspection summary text", examples=["All 12 racks scanned, 1 anomaly at zone-C1"])
+    status: Optional[str] = Field(None, description="Outcome status, e.g. 'completed', 'failed', 'partial'", examples=["completed"])
+    location: Optional[str] = Field(None, description="Where the inspection ran, e.g. 'zone-C1'", examples=["zone-C1"])
+    image_urls: Optional[List[str]] = Field(None, description="Optional inspection image links related to this summary")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata object")
+
+    class Config:
+        extra = "allow"
+
+
+def summary_save(robot_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Append an inspection summary for a robot. Saves to Supabase when configured;
+    always keeps an in-memory copy."""
+    SUMMARY_STORE.setdefault(robot_id, []).append(row)
+    if supabase is not None:
+        try:
+            supabase.table(SUPABASE_SUMMARY_TABLE).insert(row).execute()
+        except Exception as e:
+            print(f"[supabase] inspection-summary save failed (kept in memory): {e}")
+    return row
+
+
+def summary_load(robot_id: str) -> List[Dict[str, Any]]:
+    """Load all inspection summaries for a robot. Prefers Supabase, falls back to
+    memory. Oldest first."""
+    if supabase is not None:
+        try:
+            res = (
+                supabase.table(SUPABASE_SUMMARY_TABLE)
+                .select("*")
+                .eq("robot_id", robot_id)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            if res.data is not None:
+                SUMMARY_STORE[robot_id] = res.data
+                return res.data
+        except Exception as e:
+            print(f"[supabase] inspection-summary load failed, using memory: {e}")
+    return SUMMARY_STORE.get(robot_id, [])
+
+
+@app.post(
+    "/event/inspection-summary",
+    summary="Store an inspection summary for a robot",
+    description=(
+        "Store an inspection summary for a robot, tied to the generated "
+        "inspection/schedule id. Send 'robot_id', at least one of 'inspection_id' / "
+        "'schedule_id', and the 'summary' text. The summary is saved to Supabase, "
+        "added to the event log, and broadcast. Fetch summaries back with "
+        "GET /event/inspection-summary/{robot_id}."
+    ),
+    operation_id="postInspectionSummary",
+    tags=["Events"],
+)
+async def post_inspection_summary(
+    payload: InspectionSummaryRequest = Body(
+        ...,
+        openapi_examples={
+            "by_inspection_id": {
+                "summary": "Summary by inspection id",
+                "value": {
+                    "robot_id": "robot-01",
+                    "inspection_id": "insp-2026-0042",
+                    "summary": "All 12 racks scanned, 1 anomaly found at zone-C1",
+                    "status": "completed",
+                    "location": "zone-C1",
+                },
+            },
+            "by_schedule_id": {
+                "summary": "Summary by schedule id (with image links)",
+                "value": {
+                    "robot_id": "robot-01",
+                    "schedule_id": "sch-1187",
+                    "summary": "Scheduled night inspection finished, no issues",
+                    "status": "completed",
+                    "image_urls": ["https://example.com/insp/robot-01/frame1.jpg"],
+                },
+            },
+        },
+    )
+):
+    robot_id = str(payload.robot_id)
+    if not payload.inspection_id and not payload.schedule_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Send at least one of 'inspection_id' or 'schedule_id'.",
+        )
+
+    timestamp = datetime.now(IST).isoformat()
+    row = {
+        "robot_id": robot_id,
+        "inspection_id": payload.inspection_id,
+        "schedule_id": payload.schedule_id,
+        "summary": payload.summary,
+        "status": payload.status,
+        "location": payload.location,
+        "image_urls": payload.image_urls or [],
+        "created_at": timestamp,
+    }
+    summary_save(robot_id, row)
+
+    metadata = build_metadata(payload.metadata, source="robot", timestamp=timestamp)
+    event_data = {k: v for k, v in row.items() if k != "robot_id"}
+    store_event(robot_id, "inspection-summary", event_data, metadata, timestamp)
+    await manager.broadcast({
+        "type": "event",
+        "robot": robot_id,
+        "event": "inspection-summary",
+        "data": event_data,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    })
+
+    return {
+        "status": "success",
+        "event": "inspection-summary",
+        "robot_id": robot_id,
+        "message": f"Robot {robot_id}: inspection summary saved",
+        "inspection_id": payload.inspection_id,
+        "schedule_id": payload.schedule_id,
+        "summary": row,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    }
+
+
+@app.get(
+    "/event/inspection-summary/{robot_id}",
+    summary="Get a robot's inspection summaries",
+    description=(
+        "Returns the inspection summaries saved for a robot, oldest first. "
+        "Optionally filter by 'inspection_id' or 'schedule_id' query params."
+    ),
+    operation_id="getInspectionSummaries",
+    tags=["Events"],
+)
+async def get_inspection_summaries(
+    robot_id: str,
+    inspection_id: Optional[str] = Query(None, description="Filter by a specific inspection id"),
+    schedule_id: Optional[str] = Query(None, description="Filter by a specific schedule id"),
+):
+    rows = summary_load(robot_id)
+    if inspection_id:
+        rows = [r for r in rows if r.get("inspection_id") == inspection_id]
+    if schedule_id:
+        rows = [r for r in rows if r.get("schedule_id") == schedule_id]
+    return {
+        "robot": robot_id,
+        "count": len(rows),
+        "summaries": rows,
+    }
+
+
+# -----------------------------
 # GET robot events
 # -----------------------------
 @app.get("/event/{robot_id}", summary="Get recent events for a robot",
