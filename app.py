@@ -30,9 +30,9 @@ app = FastAPI(
     title="Daksha Robot Event API",
     version="2.8.1",
     description=API_DESCRIPTION,
-    contact={"name": "Daksha", "url": "https://tara-gen-1v2.onrender.com"},
+    contact={"name": "Daksha", "url": "https://infosys-0vqk.onrender.com"},
     servers=[
-        {"url": "https://tara-gen-1v2.onrender.com", "description": "Production"}
+        {"url": "https://infosys-0vqk.onrender.com", "description": "Production"}
     ],
 )
 
@@ -524,6 +524,12 @@ async def root():
             "POST /event/map                  (robot_id + data = POI names  -> saved to JSON)",
             "GET /event/map/{robot_id}        (saved map POI names for a robot)",
             "DELETE /event/map/{robot_id}     (delete a robot's saved map)",
+            "POST /event/robot-status         (robot_id + status + battery/location)",
+            "GET /event/robot-status/{robot_id}",
+            "POST /event/inspection-image     (robot_id + image_url / image_urls)",
+            "GET /event/inspection-image/{robot_id}   (paginated: limit/offset/order)",
+            "POST /event/inspection-summary   (robot_id + inspection_id/schedule_id + summary)",
+            "GET /event/inspection-summary/{robot_id}",
             "POST /event/{robot_id}/{event_name}",
             "GET /event/{robot_id}",
             "GET /event/{robot_id}/{event_name}",
@@ -984,9 +990,12 @@ def image_load(robot_id: str, limit: int = 50, offset: int = 0,
                 .range(offset, offset + limit - 1)
                 .execute()
             )
-            if res.data is not None:
-                total = res.count if res.count is not None else len(res.data)
-                return res.data, total
+            # Trust Supabase only when it actually has rows for this robot.
+            # An empty result may mean a write fell back to memory, so fall through.
+            if res.count and res.count > 0:
+                return res.data, res.count
+            if res.data:
+                return res.data, len(res.data)
         except Exception as e:
             print(f"[supabase] inspection-image load failed, using memory: {e}")
 
@@ -1253,7 +1262,9 @@ def summary_load(robot_id: str) -> List[Dict[str, Any]]:
                 .order("created_at", desc=False)
                 .execute()
             )
-            if res.data is not None:
+            # Use Supabase only when it has rows; otherwise fall back to memory
+            # (a write may have fallen back to memory if the table was missing).
+            if res.data:
                 SUMMARY_STORE[robot_id] = res.data
                 return res.data
         except Exception as e:
