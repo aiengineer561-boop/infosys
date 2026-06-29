@@ -7,7 +7,6 @@ import uvicorn
 import json
 import os
 import re
-import uuid
 from datetime import datetime, timezone, timedelta
 
 # India Standard Time (UTC+5:30, no DST)
@@ -70,9 +69,17 @@ os.makedirs(POI_DIR, exist_ok=True)
 # NEVER hard-code the key. For a backend service, use the service_role key.
 # If these are unset (or the supabase package isn't installed), the API
 # transparently falls back to local-file storage under POI_DIR.
+#
+# NOTE: the URL/key below are a temporary fallback so this backend runs without
+# any env setup. An env var, if set, always overrides them. This is a publishable
+# (anon) key on a throwaway project; rotate it in the Supabase dashboard before
+# this becomes anything more than temporary, and prefer a real env var in prod.
 # -----------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+_SUPABASE_URL_FALLBACK = "https://rycqrhlpccnufkkqdiwj.supabase.co"
+_SUPABASE_KEY_FALLBACK = "sb_publishable_l0SvKM4qqMBVspNwDPVEoA_P54w5SRK"
+
+SUPABASE_URL = os.getenv("SUPABASE_URL") or _SUPABASE_URL_FALLBACK
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or _SUPABASE_KEY_FALLBACK
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "robot_maps")
 
 supabase = None
@@ -929,9 +936,9 @@ class InspectionImageRequest(BaseModel):
     specific inspection. The links are saved to Supabase and can later be fetched
     by robot id, so the user gets back the image links for that robot."""
     robot_id: str = Field(..., description="Reporting robot id, e.g. 'robot-01'", examples=["robot-01"])
-    inspection_id: Optional[str] = Field(
+    inspection_id: Optional[int] = Field(
         None, description="Link these images to an inspection_id from POST /event/inspection",
-        examples=["b3b8f5c2-4a1e-4d3b-9c2a-7e6f8a9b0c1d"],
+        examples=[12],
     )
     image_url: Optional[str] = Field(
         None, description="A single inspection image link",
@@ -1086,21 +1093,25 @@ async def get_robot_status_update(robot_id: str):
 
 # -----------------------------
 # inspections (NEW) — parent record with a generated primary id
-# POST /event/inspection -> a uuid inspection_id is generated and returned.
-# Images and summaries link back to it via that inspection_id.
+# POST /event/inspection -> a simple numeric inspection_id (1, 2, 3, ...) is
+# generated and returned. Images and summaries link back to it via that id.
 # Declared BEFORE the generic /event/{robot_id}/... routes so its two-segment
 # GET paths aren't swallowed by /event/{robot_id}/{event_name}.
 # -----------------------------
 SUPABASE_INSPECTION_TABLE = os.getenv("SUPABASE_INSPECTION_TABLE", "inspections")
 
 # in-memory fallback: inspection_id -> row
-INSPECTION_STORE: Dict[str, Dict[str, Any]] = {}
+INSPECTION_STORE: Dict[int, Dict[str, Any]] = {}
+# in-memory id counter, used ONLY when Supabase is off/unavailable so ids still
+# come out as simple numbers (1, 2, 3, ...). When Supabase is on, the DB's
+# bigint identity column assigns the id and we read it back.
+_INSPECTION_COUNTER = 0
 
 
 class InspectionCreateRequest(BaseModel):
     """Body for POST /event/inspection. Creates an inspection record. The server
-    generates the inspection_id and returns it; pass that id to the image and
-    summary endpoints to link them to this inspection."""
+    generates a simple numeric inspection_id (1, 2, 3, ...) and returns it; pass
+    that id to the image and summary endpoints to link them to this inspection."""
     robot_id: str = Field(..., description="Target robot id, e.g. 'robot-01'", examples=["robot-01"])
     schedule_id: Optional[str] = Field(None, description="Optional schedule id this inspection belongs to", examples=["sch-1187"])
     status: Optional[str] = Field("pending", description="Initial status", examples=["pending"])
@@ -1112,19 +1123,43 @@ class InspectionCreateRequest(BaseModel):
         extra = "allow"
 
 
-def inspection_save(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Insert/replace an inspection row. Saves to Supabase when configured; always
-    keeps an in-memory copy keyed by inspection_id."""
-    INSPECTION_STORE[row["inspection_id"]] = row
+def inspection_create(robot_id: str, schedule_id: Optional[str], status: Optional[str],
+                      location: Optional[str], summary: Optional[str],
+                      timestamp: str) -> Dict[str, Any]:
+    """Create a new inspection and return the full row including the generated
+    numeric inspection_id. When Supabase is configured, the DB's identity column
+    assigns the id and we read it back from the insert result. Otherwise an
+    in-memory counter assigns it. Always keeps an in-memory copy."""
+    global _INSPECTION_COUNTER
+    base = {
+        "robot_id": robot_id,
+        "schedule_id": schedule_id,
+        "status": status or "pending",
+        "location": location,
+        "summary": summary,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
     if supabase is not None:
         try:
-            supabase.table(SUPABASE_INSPECTION_TABLE).upsert(row, on_conflict="inspection_id").execute()
+            # do NOT send inspection_id -> let the DB identity column generate it
+            res = supabase.table(SUPABASE_INSPECTION_TABLE).insert(base).execute()
+            if res.data:
+                row = res.data[0]
+                INSPECTION_STORE[row["inspection_id"]] = row
+                return row
         except Exception as e:
-            print(f"[supabase] inspection save failed (kept in memory): {e}")
+            print(f"[supabase] inspection create failed, using memory counter: {e}")
+
+    # in-memory fallback: simple incrementing number
+    _INSPECTION_COUNTER += 1
+    row = {"inspection_id": _INSPECTION_COUNTER, **base}
+    INSPECTION_STORE[_INSPECTION_COUNTER] = row
     return row
 
 
-def inspection_load(inspection_id: str) -> Optional[Dict[str, Any]]:
+def inspection_load(inspection_id: int) -> Optional[Dict[str, Any]]:
     """Load one inspection by its id. Prefers Supabase, falls back to memory."""
     if supabase is not None:
         try:
@@ -1184,19 +1219,16 @@ async def post_create_inspection(
     )
 ):
     robot_id = str(payload.robot_id)
-    inspection_id = str(uuid.uuid4())          # generated primary id
     timestamp = datetime.now(IST).isoformat()
-    row = {
-        "inspection_id": inspection_id,
-        "robot_id": robot_id,
-        "schedule_id": payload.schedule_id,
-        "status": payload.status or "pending",
-        "location": payload.location,
-        "summary": payload.summary,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-    }
-    inspection_save(row)
+    row = inspection_create(
+        robot_id=robot_id,
+        schedule_id=payload.schedule_id,
+        status=payload.status,
+        location=payload.location,
+        summary=payload.summary,
+        timestamp=timestamp,
+    )
+    inspection_id = row["inspection_id"]        # generated numeric id
 
     metadata = build_metadata(payload.metadata, source="joule", timestamp=timestamp)
     event_data = {k: v for k, v in row.items() if k != "robot_id"}
@@ -1229,7 +1261,7 @@ async def post_create_inspection(
     operation_id="getInspectionById",
     tags=["Events"],
 )
-async def get_inspection_by_id(inspection_id: str):
+async def get_inspection_by_id(inspection_id: int):
     row = inspection_load(inspection_id)
     return {"inspection_id": inspection_id, "found": row is not None, "inspection": row}
 
@@ -1287,7 +1319,7 @@ async def post_inspection_image(
                 "summary": "Linked to an inspection",
                 "value": {
                     "robot_id": "robot-01",
-                    "inspection_id": "b3b8f5c2-4a1e-4d3b-9c2a-7e6f8a9b0c1d",
+                    "inspection_id": 12,
                     "image_url": "https://example.com/insp/robot-01/frame1.jpg",
                 },
             },
@@ -1410,8 +1442,8 @@ class InspectionSummaryRequest(BaseModel):
     one is required), and the summary text in 'summary'. Optionally attach status,
     location, and image links. Fetch them back by robot id."""
     robot_id: str = Field(..., description="Target robot id, e.g. 'robot-01'", examples=["robot-01"])
-    inspection_id: Optional[str] = Field(
-        None, description="The generated inspection id, e.g. 'insp-2026-0042'", examples=["insp-2026-0042"]
+    inspection_id: Optional[int] = Field(
+        None, description="The generated inspection id from POST /event/inspection, e.g. 12", examples=[12]
     )
     schedule_id: Optional[str] = Field(
         None, description="The generated schedule id, e.g. 'sch-1187'", examples=["sch-1187"]
@@ -1481,7 +1513,7 @@ async def post_inspection_summary(
                 "summary": "Summary by inspection id",
                 "value": {
                     "robot_id": "robot-01",
-                    "inspection_id": "insp-2026-0042",
+                    "inspection_id": 12,
                     "summary": "All 12 racks scanned, 1 anomaly found at zone-C1",
                     "status": "completed",
                     "location": "zone-C1",
