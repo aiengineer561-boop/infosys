@@ -7,6 +7,7 @@ import uvicorn
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 
 # India Standard Time (UTC+5:30, no DST)
@@ -526,7 +527,10 @@ async def root():
             "DELETE /event/map/{robot_id}     (delete a robot's saved map)",
             "POST /event/robot-status         (robot_id + status + battery/location)",
             "GET /event/robot-status/{robot_id}",
-            "POST /event/inspection-image     (robot_id + image_url / image_urls)",
+            "POST /event/inspection            (robot_id -> creates + returns inspection_id)",
+            "GET /event/inspection/{inspection_id}",
+            "GET /event/inspections/{robot_id}",
+            "POST /event/inspection-image     (robot_id + image_url / image_urls + inspection_id)",
             "GET /event/inspection-image/{robot_id}   (paginated: limit/offset/order)",
             "POST /event/inspection-summary   (robot_id + inspection_id/schedule_id + summary)",
             "GET /event/inspection-summary/{robot_id}",
@@ -920,10 +924,15 @@ class RobotStatusUpdateRequest(BaseModel):
 class InspectionImageRequest(BaseModel):
     """Body for POST /event/inspection-image. Stores one or more inspection-image
     LINKS for a robot. Put the robot id in 'robot_id' and the link(s) in
-    'image_url' (a single URL) and/or 'image_urls' (a list of URLs). The links are
-    saved to Supabase and can later be fetched by robot id, so the user gets back
-    the image links for that robot."""
+    'image_url' (a single URL) and/or 'image_urls' (a list of URLs). Optionally
+    pass an 'inspection_id' (from POST /event/inspection) to link the images to a
+    specific inspection. The links are saved to Supabase and can later be fetched
+    by robot id, so the user gets back the image links for that robot."""
     robot_id: str = Field(..., description="Reporting robot id, e.g. 'robot-01'", examples=["robot-01"])
+    inspection_id: Optional[str] = Field(
+        None, description="Link these images to an inspection_id from POST /event/inspection",
+        examples=["b3b8f5c2-4a1e-4d3b-9c2a-7e6f8a9b0c1d"],
+    )
     image_url: Optional[str] = Field(
         None, description="A single inspection image link",
         examples=["https://example.com/inspections/robot-01/frame1.jpg"],
@@ -1075,15 +1084,178 @@ async def get_robot_status_update(robot_id: str):
     return {"robot": robot_id, "found": status is not None, "status": status}
 
 
+# -----------------------------
+# inspections (NEW) — parent record with a generated primary id
+# POST /event/inspection -> a uuid inspection_id is generated and returned.
+# Images and summaries link back to it via that inspection_id.
+# Declared BEFORE the generic /event/{robot_id}/... routes so its two-segment
+# GET paths aren't swallowed by /event/{robot_id}/{event_name}.
+# -----------------------------
+SUPABASE_INSPECTION_TABLE = os.getenv("SUPABASE_INSPECTION_TABLE", "inspections")
+
+# in-memory fallback: inspection_id -> row
+INSPECTION_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+class InspectionCreateRequest(BaseModel):
+    """Body for POST /event/inspection. Creates an inspection record. The server
+    generates the inspection_id and returns it; pass that id to the image and
+    summary endpoints to link them to this inspection."""
+    robot_id: str = Field(..., description="Target robot id, e.g. 'robot-01'", examples=["robot-01"])
+    schedule_id: Optional[str] = Field(None, description="Optional schedule id this inspection belongs to", examples=["sch-1187"])
+    status: Optional[str] = Field("pending", description="Initial status", examples=["pending"])
+    location: Optional[str] = Field(None, description="Where the inspection runs, e.g. 'zone-C1'", examples=["zone-C1"])
+    summary: Optional[str] = Field(None, description="Optional initial summary text")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Optional metadata object")
+
+    class Config:
+        extra = "allow"
+
+
+def inspection_save(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Insert/replace an inspection row. Saves to Supabase when configured; always
+    keeps an in-memory copy keyed by inspection_id."""
+    INSPECTION_STORE[row["inspection_id"]] = row
+    if supabase is not None:
+        try:
+            supabase.table(SUPABASE_INSPECTION_TABLE).upsert(row, on_conflict="inspection_id").execute()
+        except Exception as e:
+            print(f"[supabase] inspection save failed (kept in memory): {e}")
+    return row
+
+
+def inspection_load(inspection_id: str) -> Optional[Dict[str, Any]]:
+    """Load one inspection by its id. Prefers Supabase, falls back to memory."""
+    if supabase is not None:
+        try:
+            res = supabase.table(SUPABASE_INSPECTION_TABLE).select("*").eq("inspection_id", inspection_id).execute()
+            if res.data:
+                INSPECTION_STORE[inspection_id] = res.data[0]
+                return res.data[0]
+        except Exception as e:
+            print(f"[supabase] inspection load failed, using memory: {e}")
+    return INSPECTION_STORE.get(inspection_id)
+
+
+def inspection_load_by_robot(robot_id: str) -> List[Dict[str, Any]]:
+    """List inspections for a robot, newest first. Prefers Supabase, falls back to memory."""
+    if supabase is not None:
+        try:
+            res = (
+                supabase.table(SUPABASE_INSPECTION_TABLE)
+                .select("*")
+                .eq("robot_id", robot_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            if res.data:
+                return res.data
+        except Exception as e:
+            print(f"[supabase] inspection list failed, using memory: {e}")
+    rows = [r for r in INSPECTION_STORE.values() if r.get("robot_id") == robot_id]
+    return list(reversed(rows))
+
+
+@app.post(
+    "/event/inspection",
+    summary="Create an inspection (generates an inspection_id)",
+    description=(
+        "Create an inspection record for a robot. The server generates a unique "
+        "inspection_id and returns it in the response. Pass that id to "
+        "POST /event/inspection-image and POST /event/inspection-summary to link "
+        "images and summaries to this inspection."
+    ),
+    operation_id="postCreateInspection",
+    tags=["Events"],
+)
+async def post_create_inspection(
+    payload: InspectionCreateRequest = Body(
+        ...,
+        openapi_examples={
+            "create": {
+                "summary": "Create an inspection",
+                "value": {"robot_id": "robot-01", "location": "zone-C1", "status": "pending"},
+            },
+            "with_schedule": {
+                "summary": "Create from a schedule",
+                "value": {"robot_id": "robot-01", "schedule_id": "sch-1187", "location": "zone-C1"},
+            },
+        },
+    )
+):
+    robot_id = str(payload.robot_id)
+    inspection_id = str(uuid.uuid4())          # generated primary id
+    timestamp = datetime.now(IST).isoformat()
+    row = {
+        "inspection_id": inspection_id,
+        "robot_id": robot_id,
+        "schedule_id": payload.schedule_id,
+        "status": payload.status or "pending",
+        "location": payload.location,
+        "summary": payload.summary,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    inspection_save(row)
+
+    metadata = build_metadata(payload.metadata, source="joule", timestamp=timestamp)
+    event_data = {k: v for k, v in row.items() if k != "robot_id"}
+    store_event(robot_id, "inspection", event_data, metadata, timestamp)
+    await manager.broadcast({
+        "type": "event",
+        "robot": robot_id,
+        "event": "inspection",
+        "data": event_data,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    })
+
+    return {
+        "status": "success",
+        "event": "inspection",
+        "robot_id": robot_id,
+        "inspection_id": inspection_id,        # <-- the generated id, returned to the caller
+        "message": f"Robot {robot_id}: inspection created",
+        "inspection": row,
+        "metadata": metadata,
+        "timestamp": timestamp,
+    }
+
+
+@app.get(
+    "/event/inspection/{inspection_id}",
+    summary="Get one inspection by its id",
+    description="Returns a single inspection record (with its generated inspection_id).",
+    operation_id="getInspectionById",
+    tags=["Events"],
+)
+async def get_inspection_by_id(inspection_id: str):
+    row = inspection_load(inspection_id)
+    return {"inspection_id": inspection_id, "found": row is not None, "inspection": row}
+
+
+@app.get(
+    "/event/inspections/{robot_id}",
+    summary="List a robot's inspections",
+    description="Returns all inspections created for a robot, newest first.",
+    operation_id="getInspectionsByRobot",
+    tags=["Events"],
+)
+async def get_inspections_by_robot(robot_id: str):
+    rows = inspection_load_by_robot(robot_id)
+    return {"robot": robot_id, "count": len(rows), "inspections": rows}
+
+
 @app.post(
     "/event/inspection-image",
     summary="Upload inspection image link(s) for a robot",
     description=(
         "Store one or more inspection-image LINKS for a robot. Send the robot id in "
         "'robot_id' and the link(s) in 'image_url' (single) and/or 'image_urls' "
-        "(list). The links are saved to Supabase, added to the event log, and "
-        "broadcast to WebSocket listeners. Fetch them back as links with "
-        "GET /event/inspection-image/{robot_id}."
+        "(list). Optionally pass an 'inspection_id' (from POST /event/inspection) to "
+        "link the images to a specific inspection. The links are saved to Supabase, "
+        "added to the event log, and broadcast to WebSocket listeners. Fetch them "
+        "back as links with GET /event/inspection-image/{robot_id}."
     ),
     operation_id="postInspectionImage",
     tags=["Events"],
@@ -1111,6 +1283,14 @@ async def post_inspection_image(
                     "note": "rack inspection",
                 },
             },
+            "linked_to_inspection": {
+                "summary": "Linked to an inspection",
+                "value": {
+                    "robot_id": "robot-01",
+                    "inspection_id": "b3b8f5c2-4a1e-4d3b-9c2a-7e6f8a9b0c1d",
+                    "image_url": "https://example.com/insp/robot-01/frame1.jpg",
+                },
+            },
         },
     )
 ):
@@ -1132,6 +1312,7 @@ async def post_inspection_image(
     rows = [
         {
             "robot_id": robot_id,
+            "inspection_id": payload.inspection_id,
             "image_url": u,
             "location": payload.location,
             "note": payload.note,
@@ -1142,7 +1323,13 @@ async def post_inspection_image(
     image_save(robot_id, rows)
 
     metadata = build_metadata(payload.metadata, source="robot", timestamp=timestamp)
-    event_data = {"links": urls, "image_count": len(urls), "location": payload.location, "note": payload.note}
+    event_data = {
+        "links": urls,
+        "image_count": len(urls),
+        "inspection_id": payload.inspection_id,
+        "location": payload.location,
+        "note": payload.note,
+    }
     store_event(robot_id, "inspection-image", event_data, metadata, timestamp)
     await manager.broadcast({
         "type": "event",
@@ -1157,6 +1344,7 @@ async def post_inspection_image(
         "status": "success",
         "event": "inspection-image",
         "robot_id": robot_id,
+        "inspection_id": payload.inspection_id,
         "message": f"Robot {robot_id}: {len(urls)} inspection image link(s) saved",
         "image_count": len(urls),
         "links": urls,
